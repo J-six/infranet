@@ -1,0 +1,173 @@
+--!native
+
+local RunService = game:GetService("RunService")
+
+local packetIDs = require(script.Parent.Parent.namespaces.packetIDs)
+local queryIDs = require(script.Parent.Parent.namespaces.queryIDs)
+local readRefs = require(script.Parent.readRefs)
+local types = require(script.Parent.Parent.types)
+local bufferWriter = require(script.Parent.bufferWriter)
+
+local alloc = bufferWriter.alloc
+local u8 = bufferWriter.u8
+local load = bufferWriter.load
+
+local packetRef = packetIDs.ref()
+local queryRef = queryIDs.ref()
+local freeThread: thread?
+
+local function functionPasser(callback, ...)
+	local aquiredThread = freeThread
+	freeThread = nil
+	callback(...)
+	freeThread = aquiredThread
+end
+
+local function yielder()
+	while true do
+		functionPasser(coroutine.yield())
+	end
+end
+
+local function runListener(callback, listenOnce: boolean, packet, ...)
+	if freeThread == nil then
+		freeThread = coroutine.create(yielder)
+		coroutine.resume(freeThread :: thread)
+	end
+
+	task.spawn(freeThread :: thread, callback, ...)
+	if listenOnce then
+		packet.disconnect(callback)
+	end
+end
+
+local function runQueryListener(callback, listenOnce: boolean, query, ...)
+	local result 
+	local ts = tick();
+	if freeThread == nil then
+		freeThread = coroutine.create(yielder)
+		coroutine.resume(freeThread :: thread)
+	end
+
+	task.spawn(freeThread :: thread, function(...)
+		result = callback(...)
+	end, ...)
+
+	repeat
+		task.wait()
+	until result or (tick() - ts) > 10;
+
+	if result == nil then
+		print("queryResult hung for 10 seconds, returning null.")
+	end
+
+	if listenOnce then
+		query.disconnect(callback)
+	end
+
+	return result
+end
+
+local function create()
+	return {
+		cursor = 0,
+		size = 256,
+		references = {},
+		buff = buffer.create(256),
+	}
+end
+
+local function dump(channel: types.channelData): (buffer, { unknown }?)
+	local cursor = channel.cursor
+	local dumpBuffer = buffer.create(cursor)
+
+	buffer.copy(dumpBuffer, 0, channel.buff, 0, cursor)
+
+	return dumpBuffer, if #channel.references > 0 then channel.references else nil
+end
+
+return function(incomingBuffer: buffer, references: { [number]: unknown }?, player: Player?, readType: string?, id: number?, incoming: boolean?)
+	local length = buffer.len(incomingBuffer)
+	local readCursor = 0
+	readType = readType or "packet"
+
+	readRefs.set(references)
+
+	while readCursor < length do
+		local readablePacketOrQuery
+
+		if readType == "packet" then
+			readablePacketOrQuery = packetRef[buffer.readu8(incomingBuffer, readCursor)]
+		elseif readType == "query" then
+			readablePacketOrQuery = queryRef[buffer.readu8(incomingBuffer, readCursor)]
+		end
+
+		if not readablePacketOrQuery then
+			print("No readable entity found for ID: " .. buffer.readu8(incomingBuffer, readCursor) .. " for type: " .. readType)
+			return
+		end
+
+		readCursor += 1
+
+		local value, valueLength
+
+		local suc = pcall(function()
+			if readType == "query" then
+				local reader = incoming and readablePacketOrQuery.responseReader or readablePacketOrQuery.requestReader
+				value, valueLength = reader(incomingBuffer, readCursor)
+			elseif readType == "packet" then
+				value, valueLength = readablePacketOrQuery.reader(incomingBuffer, readCursor)
+			end
+		end)
+		if not suc then
+			print("Failed to read incoming data from ".. readType)
+			return
+		end
+
+		readCursor += valueLength
+
+		if readType == "packet" then
+			for _, listener in readablePacketOrQuery.getListeners() do
+				if typeof(listener) == "table" then
+					runListener(listener["OnceCallback"], true, readablePacketOrQuery, value, player)
+				elseif typeof(listener) == "function" then
+					runListener(listener, false, readablePacketOrQuery, value, player)
+				else
+					print("A packet was called that has no listener!")
+					return
+				end
+			end
+		elseif readType == "query" then
+			if incoming then
+				return value
+			else
+				local listener = readablePacketOrQuery.getListeners()[1]
+				local response 
+
+				if typeof(listener) == "table" then
+					response = runQueryListener(listener["OnceCallback"], true, readablePacketOrQuery, value, player)
+				elseif typeof(listener) == "function" then
+					response = runQueryListener(listener, false, readablePacketOrQuery, value, player)
+				else
+					print("A query was called that has no listener!")
+					return
+				end
+
+				local func = create()
+				func = load(func)
+
+				alloc(1)
+				u8(id)
+				readablePacketOrQuery.responseWriter(response)
+
+				func = bufferWriter.export()
+
+				if func.cursor > 0 then
+					local dumpBuffer, reference = dump(func)
+
+					return dumpBuffer, reference
+				end
+			end
+		end
+	end
+end
